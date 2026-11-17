@@ -1,0 +1,567 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Research Agent</title>
+  <link rel="stylesheet" href="style.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+</head>
+<body>
+
+  <div id="loading">
+    <h2>Loading Research Agent...</h2>
+    <div class="progress-bar"><div class="progress-fill" id="progress"></div></div>
+    <div id="loading-status">Initializing...</div>
+  </div>
+
+  <div id="app" class="with-log">
+    <div class="chat-col">
+      <div class="header">
+        <h1>Research Agent</h1>
+        <button id="clear-btn">New Research</button>
+      </div>
+      <div class="tool-bar">
+        <span id="tool-names">Tools: Wikipedia · Weather · Calculator · Time · Dictionary · Currency · Papers · Units · Your files</span>
+        <span class="docs-ctl">
+          <button id="attach-btn" class="small">Attach files</button>
+          <span id="docs-count">0 files</span>
+          <button id="clear-docs" class="small">Clear</button>
+          <input type="file" id="file" multiple hidden accept=".pdf,application/pdf,.txt,.md,.csv,.json,.tsv,.log,.html,.xml,.js,.py,.c,.cpp,.v,.sv,.vhd,.ino,text/*">
+        </span>
+      </div>
+      <div id="chat-messages"></div>
+      <div class="input-bar">
+        <input type="text" id="input" placeholder="Ask me anything — Wikipedia, papers, your files, currency, units..." />
+        <button id="send">Send</button>
+      </div>
+    </div>
+    <aside id="log">
+      <div class="log-head">Tool log <span id="tool-count">0 tool calls</span></div>
+      <ol id="tool-list"></ol>
+    </aside>
+  </div>
+
+  <script src="nest.js" data-page="7"></script>  <!-- your peacock, its feathers and your next quest -->
+  <script type="module">
+    import { CreateMLCEngine } from "https://esm.run/@mlc-ai/web-llm@0.2.88";
+    import { marked } from "https://esm.run/marked@15.0.12";
+    import DOMPurify from "https://esm.run/dompurify@3.4.17";
+
+    marked.setOptions({ breaks: true, gfm: true });
+
+    const SYSTEM_PROMPT = `You are a research agent with access to tools. You can use tools to look up information before answering.
+
+AVAILABLE TOOLS (use the exact format shown):
+[TOOL wikipedia "search query"]   facts, people, places, concepts
+[TOOL papers "search query"]      academic papers (title, authors, year, citations)
+[TOOL hn "search query"]          tech news and discussion from Hacker News
+[TOOL define "word"]              dictionary definition of one English word
+[TOOL weather "city name"]        current weather
+[TOOL currency "100 USD to INR"]  live exchange rates
+[TOOL convert "5 km to miles"]    unit conversion (length, mass, volume, speed, temperature)
+[TOOL calc "math expression"]     arithmetic, e.g. "(12*7)/3"
+[TOOL datetime "Asia/Tokyo"]      current date and time; argument optional
+[TOOL docs "search query"]        search the files the user attached
+
+RULES:
+- When the user asks a factual question, USE a tool first — do not guess.
+- If the user mentions "my files", "my notes", "the document" or "the attached file", use docs.
+- Output EXACTLY ONE tool call per response when you need information.
+- Put the tool call on its own line at the START of your response, before any other text.
+- After you receive tool results, answer the user's question using those results.
+- You may do multiple rounds of tool calls if you need more information.
+- If the tool returns useful info, cite it naturally in your answer.
+- For simple greetings, opinions, or conversational messages, just respond normally — no tool needed.
+- Keep final answers concise — 2-4 sentences with the key facts.
+
+EXAMPLES:
+User: "What is the population of Japan?"
+You: [TOOL wikipedia "Japan population"]
+
+User: "Find papers on low-power SRAM design"
+You: [TOOL papers "low-power SRAM design"]
+
+User: "How much is 250 dollars in rupees?"
+You: [TOOL currency "250 USD to INR"]
+
+(After receiving results, you answer using the data.)`;
+
+    const WELCOME = "Welcome, ask me anything.";
+
+    const loadingEl = document.getElementById("loading");
+    const appEl = document.getElementById("app");
+    const progressEl = document.getElementById("progress");
+    const loadingStatus = document.getElementById("loading-status");
+    const chatMessages = document.getElementById("chat-messages");
+    const inputEl = document.getElementById("input");
+    const sendBtn = document.getElementById("send");
+    const clearBtn = document.getElementById("clear-btn");
+    const toolCountEl = document.getElementById("tool-count");
+    const toolListEl = document.getElementById("tool-list");
+    const logEl = document.getElementById("log");
+    const fileInput = document.getElementById("file");
+    const attachBtn = document.getElementById("attach-btn");
+    const clearDocsBtn = document.getElementById("clear-docs");
+    const docsCountEl = document.getElementById("docs-count");
+
+    const engine = await CreateMLCEngine("gemma-2-2b-it-q4f16_1-MLC", {
+      initProgressCallback: ({ text, progress }) => {
+        loadingStatus.textContent = text;
+        if (progress !== undefined) progressEl.style.width = (progress * 100) + "%";
+      }
+    });
+
+    loadingEl.style.display = "none";
+    appEl.style.display = "flex";
+
+    let chatHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+    let generating = false;
+    let toolCalls = 0;
+    const MAX_TOOL_ROUNDS = 3; // ponytail: prevent infinite loops if model keeps calling tools
+    const MAX_HISTORY_CHARS = 9000; // gemma-2-2b has a ~4k-token window; keep headroom for the reply
+
+    // --- Helpers ---
+
+    async function getJSON(url) {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      return res.json();
+    }
+
+    // Drop the oldest user/assistant pair until the conversation fits the small context window
+    function trimHistory() {
+      const size = () => chatHistory.reduce((n, m) => n + m.content.length, 0);
+      while (size() > MAX_HISTORY_CHARS && chatHistory.length > 3) chatHistory.splice(1, 2);
+    }
+
+    // --- Tools: knowledge ---
+
+    async function searchWikipedia(query) {
+      const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=3&format=json&origin=*`;
+      const res = await fetch(url);
+      const data = await res.json();
+      const results = data.query?.search || [];
+      if (results.length === 0) return { text: "No Wikipedia results found.", url: null };
+
+      const title = results[0].title;
+      const pageUrl = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
+
+      const extractRes = await fetch(
+        `https://en.wikipedia.org/w/api.php?action=query&titles=${encodeURIComponent(title)}&prop=extracts|pageimages&exintro=1&explaintext=1&piprop=thumbnail&pithumbsize=400&format=json&origin=*`
+      );
+      const extractData = await extractRes.json();
+      const pages = extractData.query?.pages || {};
+      const page = Object.values(pages)[0];
+      const extract = page?.extract || "No extract available.";
+      const image = page?.thumbnail?.source || null;
+
+      // ponytail: truncate to ~500 chars so we don't blow the context window
+      const truncated = extract.length > 500 ? extract.slice(0, 500) + "..." : extract;
+      return { text: `Wikipedia: ${title}\n${truncated}`, url: pageUrl, title, image };
+    }
+
+    // OpenAlex: free scholarly index, no API key, CORS enabled
+    async function searchPapers(query) {
+      const data = await getJSON(
+        `https://api.openalex.org/works?search=${encodeURIComponent(query)}&per-page=4&select=title,publication_year,cited_by_count,doi,authorships`
+      );
+      const works = data.results || [];
+      if (!works.length) return { text: `No papers found for: ${query}` };
+      const lines = works.map((w, i) => {
+        const authors = (w.authorships || []).slice(0, 3).map(a => a.author?.display_name).filter(Boolean).join(", ");
+        return `${i + 1}. ${w.title} (${w.publication_year}) — ${authors || "unknown authors"} — ${w.cited_by_count} citations`;
+      });
+      return { text: `Papers for "${query}":\n${lines.join("\n")}`, url: works[0].doi || null, title: "Top result (DOI)" };
+    }
+
+  
+
+    async function defineWord(word) {
+      const w = word.trim().split(/\s+/)[0];
+      const res = await fetch(`https://api.dictionaryapi.dev/v2/entries/en/${encodeURIComponent(w)}`);
+      if (!res.ok) return { text: `No dictionary entry found for "${w}".` };
+      const entry = (await res.json())[0];
+      const meanings = (entry.meanings || []).slice(0, 3).map(m => `(${m.partOfSpeech}) ${m.definitions?.[0]?.definition || ""}`);
+      return { text: `${entry.word}${entry.phonetic ? " " + entry.phonetic : ""}\n${meanings.join("\n")}` };
+    }
+
+    async function getWeather(city) {
+      try {
+        const geoData = await getJSON(
+          `https://geocoding-api.open-meteo.com/v1/search?name=${encodeURIComponent(city)}&count=1&language=en&format=json`
+        );
+        const loc = geoData.results?.[0];
+        if (!loc) return { text: `Could not find location: ${city}` };
+
+        const wx = await getJSON(
+          `https://api.open-meteo.com/v1/forecast?latitude=${loc.latitude}&longitude=${loc.longitude}&current=temperature_2m,relative_humidity_2m,wind_speed_10m,weather_code&timezone=auto`
+        );
+        const c = wx.current;
+        const condition = WMO_CODES[c.weather_code] || "Unknown";
+
+        return {
+          text: `Weather in ${loc.name}, ${loc.country}:\n` +
+                `Condition: ${condition}\n` +
+                `Temperature: ${c.temperature_2m}°C\n` +
+                `Humidity: ${c.relative_humidity_2m}%\n` +
+                `Wind: ${c.wind_speed_10m} km/h`
+        };
+      } catch (e) {
+        return { text: `Weather lookup failed: ${e.message}` };
+      }
+    }
+
+    const WMO_CODES = {
+      0: "Clear sky", 1: "Mainly clear", 2: "Partly cloudy", 3: "Overcast",
+      45: "Foggy", 48: "Rime fog", 51: "Light drizzle", 53: "Drizzle",
+      55: "Heavy drizzle", 61: "Light rain", 63: "Rain", 65: "Heavy rain",
+      71: "Light snow", 73: "Snow", 75: "Heavy snow", 77: "Snow grains",
+      80: "Light showers", 81: "Showers", 82: "Heavy showers",
+      85: "Light snow showers", 86: "Heavy snow showers",
+      95: "Thunderstorm", 96: "Thunderstorm with hail", 99: "Severe thunderstorm"
+    };
+
+    // --- Tools: utilities ---
+
+    function calculate(expr) {
+      try {
+        // ponytail: only allow math chars to avoid code injection
+        const sanitized = expr.replace(/[^0-9+\-*/().%^ ]/g, "");
+        const result = Function(`"use strict"; return (${sanitized.replace(/\^/g, "**")})`)();
+        return { text: `${expr} = ${result}` };
+      } catch {
+        return { text: `Could not calculate: ${expr}` };
+      }
+    }
+
+    function getDateTime(tz) {
+      const zone = (tz || "").trim();
+      try {
+        const opts = zone ? { timeZone: zone, dateStyle: "full", timeStyle: "long" } : { dateStyle: "full", timeStyle: "long" };
+        return { text: `Current date and time${zone ? ` in ${zone}` : ""}: ${new Intl.DateTimeFormat("en-US", opts).format(new Date())}` };
+      } catch {
+        return { text: `Unknown time zone "${zone}". Use a name like "Asia/Kolkata" or "America/New_York".` };
+      }
+    }
+
+    // Frankfurter: free ECB exchange rates, no key, CORS enabled
+    async function convertCurrency(input) {
+      const m = input.match(/(?:(\d+(?:\.\d+)?)\s*)?([a-zA-Z]{3})\s*(?:to|in|into|->|\s)\s*([a-zA-Z]{3})/i);
+      if (!m) return { text: `Could not parse "${input}". Use a format like "100 USD to INR".` };
+      const amount = m[1] ? parseFloat(m[1]) : 1;
+      const from = m[2].toUpperCase(), to = m[3].toUpperCase();
+      try {
+        const data = await getJSON(`https://api.frankfurter.dev/v1/latest?base=${from}&symbols=${to}`);
+        const rate = data.rates?.[to];
+        if (rate === undefined) return { text: `No rate available for ${from} to ${to}.` };
+        return { text: `${amount} ${from} = ${(amount * rate).toFixed(2)} ${to}\n(rate ${rate}, ECB data from ${data.date})` };
+      } catch (e) {
+        return { text: `Currency lookup failed for ${from} to ${to}: ${e.message}` };
+      }
+    }
+
+    // Unit conversion
+    const UNITS = {
+      length: { m: 1, km: 1000, cm: 0.01, mm: 0.001, mi: 1609.344, ft: 0.3048, in: 0.0254, yd: 0.9144 },
+      mass: { kg: 1, g: 0.001, mg: 0.000001, lb: 0.45359237, oz: 0.028349523 },
+      volume: { l: 1, ml: 0.001, gal: 3.785411784, cup: 0.2365882365 },
+      speed: { mps: 1, kmh: 0.2777778, mph: 0.44704, kn: 0.5144444 }
+    };
+    const UNIT_ALIASES = {
+      meter: "m", metre: "m", kilometer: "km", kilometre: "km", centimeter: "cm", centimetre: "cm", millimeter: "mm", millimetre: "mm",
+      mile: "mi", foot: "ft", feet: "ft", inch: "in", inche: "in", yard: "yd",
+      kilogram: "kg", gram: "g", milligram: "mg", pound: "lb", ounce: "oz",
+      liter: "l", litre: "l", milliliter: "ml", millilitre: "ml", gallon: "gal",
+      kph: "kmh", "km/h": "kmh", "m/s": "mps", knot: "kn",
+      celsius: "c", "°c": "c", fahrenheit: "f", "°f": "f", kelvin: "k"
+    };
+    function normUnit(u) {
+      let x = u.toLowerCase().trim();
+      if (UNIT_ALIASES[x]) return UNIT_ALIASES[x];
+      if (x.endsWith("s") && x.length > 2) x = x.slice(0, -1);
+      return UNIT_ALIASES[x] || x;
+    }
+    function convertUnits(input) {
+      const m = input.match(/^\s*(-?\d+(?:\.\d+)?)\s*([a-zA-Z°/]+)\s*(?:to|in|into)\s*([a-zA-Z°/]+)\s*$/i);
+      if (!m) return { text: `Could not parse "${input}". Use a format like "5 km to miles".` };
+      const value = parseFloat(m[1]), from = normUnit(m[2]), to = normUnit(m[3]);
+      const temps = ["c", "f", "k"];
+      if (temps.includes(from) && temps.includes(to)) {
+        const c = from === "c" ? value : from === "f" ? (value - 32) * 5 / 9 : value - 273.15;
+        const out = to === "c" ? c : to === "f" ? c * 9 / 5 + 32 : c + 273.15;
+        return { text: `${value} °${from.toUpperCase()} = ${out.toFixed(2)} °${to.toUpperCase()}` };
+      }
+      for (const table of Object.values(UNITS)) {
+        if (table[from] && table[to]) {
+          const out = value * table[from] / table[to];
+          return { text: `${value} ${m[2]} = ${Number(out.toPrecision(6))} ${m[3]}` };
+        }
+      }
+      return { text: `Cannot convert "${m[2]}" to "${m[3]}". Units must be in the same category (length, mass, volume, speed, temperature).` };
+    }
+
+    // --- Tools: your own files ---
+    // Files are split into chunks and searched with a simple TF-IDF keyword score. EVerything stays in the broswer.
+
+    const DOCS_KEY = "research-agent-docs";
+    let docChunks = [];
+    try { docChunks = JSON.parse(localStorage.getItem(DOCS_KEY) || "[]"); } catch { docChunks = []; }
+
+    const STOPWORDS = new Set("the and for are but not you all can had her was one our out has have this that with from what when where which who how why about into your they their there then than them these those will would could should does did its it's".split(" "));
+    const tokenize = s => (s.toLowerCase().match(/[a-z0-9_]+/g) || []).filter(w => w.length > 2 && !STOPWORDS.has(w));
+
+    function chunkText(name, text, page) {
+      const pieces = text.split(/\n{2,}/).flatMap(p => p.match(/[\s\S]{1,800}/g) || []);
+      const chunks = [];
+      let buf = "";
+      const push = () => chunks.push(page ? { file: name, page, text: buf.trim() } : { file: name, text: buf.trim() });
+      for (const p of pieces) {
+        if (buf && (buf.length + p.length) > 800) { push(); buf = ""; }
+        buf += p + "\n\n";
+      }
+      if (buf.trim()) push();
+      return chunks;
+    }
+
+    // PDFs: pdf.js is loaded on demand the first time a PDF is attached, then text is extracted page by page
+    const PDFJS_BASE = "https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/";
+    let pdfjsPromise = null;
+    function loadPdfJs() {
+      pdfjsPromise ??= import(PDFJS_BASE + "pdf.min.mjs").then(lib => {
+        lib.GlobalWorkerOptions.workerSrc = PDFJS_BASE + "pdf.worker.min.mjs";
+        return lib;
+      });
+      return pdfjsPromise;
+    }
+    async function extractPdf(file) {
+      const pdfjs = await loadPdfJs();
+      const pdf = await pdfjs.getDocument({ data: await file.arrayBuffer() }).promise;
+      const chunks = [];
+      for (let p = 1; p <= pdf.numPages; p++) {
+        const content = await (await pdf.getPage(p)).getTextContent();
+        const text = content.items.map(i => i.str + (i.hasEOL ? "\n" : " ")).join("").replace(/[ \t]+/g, " ").trim();
+        if (text) chunks.push(...chunkText(file.name, text, p));
+      }
+      return chunks;
+    }
+
+    function saveDocs() {
+      try { localStorage.setItem(DOCS_KEY, JSON.stringify(docChunks)); return true; }
+      catch { return false; } // storage full: files still work for this session
+    }
+
+    function updateDocsCount() {
+      const files = new Set(docChunks.map(c => c.file)).size;
+      docsCountEl.textContent = `${files} file${files !== 1 ? "s" : ""} · ${docChunks.length} chunks`;
+    }
+
+    function searchDocs(query) {
+      if (!docChunks.length) return { text: "No files are loaded. Ask the user to attach files with the Attach files button." };
+      const terms = tokenize(query);
+      if (!terms.length) return { text: "Query had no searchable words." };
+      const n = docChunks.length;
+      const lowered = docChunks.map(c => c.text.toLowerCase());
+      const idf = terms.map(t => Math.log(1 + n / (1 + lowered.filter(l => l.includes(t)).length)));
+      const scored = docChunks.map((c, i) => {
+        let score = 0;
+        terms.forEach((t, k) => { score += (lowered[i].split(t).length - 1) * idf[k]; });
+        return { c, score };
+      }).filter(x => x.score > 0).sort((a, b) => b.score - a.score).slice(0, 3);
+      if (!scored.length) return { text: `Nothing in the attached files matched "${query}".` };
+      return { text: scored.map(({ c }) => `[${c.file}${c.page ? ` p.${c.page}` : ""}]\n${c.text.length > 450 ? c.text.slice(0, 450) + "..." : c.text}`).join("\n---\n") };
+    }
+
+    async function addFiles(fileList) {
+      for (const f of fileList) {
+        const isPdf = f.type === "application/pdf" || /\.pdf$/i.test(f.name);
+        const limitMB = isPdf ? 25 : 2;
+        if (f.size > limitMB * 1024 * 1024) { addMessage("welcome", `Skipped ${f.name}: over ${limitMB} MB.`); continue; }
+        let chunks;
+        try {
+          if (isPdf) addMessage("welcome", `Reading ${f.name}...`);
+          chunks = isPdf ? await extractPdf(f) : chunkText(f.name, await f.text());
+        } catch (e) {
+          addMessage("welcome", `Could not read ${f.name}: ${e.message}`);
+          continue;
+        }
+        if (!chunks.length) { addMessage("welcome", `No text found in ${f.name}. If it is a scanned PDF, it needs OCR first.`); continue; }
+        docChunks = docChunks.filter(c => c.file !== f.name);
+        docChunks.push(...chunks);
+        addMessage("welcome", `Loaded ${f.name} (${chunks.length} chunks). Ask me about it.`);
+      }
+      if (!saveDocs()) addMessage("welcome", "Files are too large to remember after a reload, but they work for this session.");
+      updateDocsCount();
+    }
+
+    // --- Tool dispatch ---
+
+    async function executeTool(toolName, toolArg) {
+      try {
+        switch (toolName) {
+          case "wikipedia": return await searchWikipedia(toolArg);
+          case "papers": return await searchPapers(toolArg);
+          case "hn": return await searchHN(toolArg);
+          case "define": return await defineWord(toolArg);
+          case "weather": return await getWeather(toolArg);
+          case "currency": return await convertCurrency(toolArg);
+          case "convert": return convertUnits(toolArg);
+          case "calc": return calculate(toolArg);
+          case "datetime": return getDateTime(toolArg);
+          case "docs": return searchDocs(toolArg);
+          default: return { text: `Unknown tool: ${toolName}` };
+        }
+      } catch (e) {
+        return { text: `Tool failed: ${e.message}` };  // e.g. offline: tell the model instead of leaving the page stuck
+      }
+    }
+
+    // Running log, right panel: an entry appears the moment the model asks for a tool and fills in when the tool returns
+    function logStart(marker, userText) {
+      const li = document.createElement("li"), head = document.createElement("div"), why = document.createElement("small"), body = document.createElement("pre");
+      head.textContent = marker;
+      why.textContent = `for: ${userText}`;
+      body.textContent = "running…";
+      li.append(head, why, body);   // textContent everywhere: the result comes from the internet
+      toolListEl.append(li);
+      logEl.scrollTop = logEl.scrollHeight;
+      const t0 = performance.now();
+      return result => {
+        head.textContent += ` · ${Math.round(performance.now() - t0)} ms`;
+        body.textContent = result.text;
+        if (result.image) li.append(Object.assign(document.createElement("img"), { src: result.image, alt: result.title || "", loading: "lazy" }));
+        if (result.url) li.append(Object.assign(document.createElement("a"), { href: result.url, target: "_blank", rel: "noopener", textContent: result.title || result.url }));
+        logEl.scrollTop = logEl.scrollHeight;
+      };
+    }
+
+    function parseToolCall(text) {
+      const match = text.match(/\[TOOL\s+(\w+)(?:\s+["“]([^"”]*)["”])?\s*\]/i);
+      if (!match) return null;
+      return { tool: match[1].toLowerCase(), arg: match[2] || "" };
+    }
+
+    // --- Markdown ---
+
+    function renderMarkdown(text) {
+      return DOMPurify.sanitize(marked.parse(text));
+    }
+
+    // --- Chat ---
+
+    function addMessage(type, text) {
+      const div = document.createElement("div");
+      div.className = "message " + type;
+      if (type === "assistant") {
+        div.innerHTML = renderMarkdown(text);
+      } else {
+        div.textContent = text;
+      }
+      chatMessages.appendChild(div);
+      chatMessages.scrollTop = chatMessages.scrollHeight;
+      return div;
+    }
+
+    function setInputEnabled(enabled) {
+      sendBtn.disabled = !enabled;
+      inputEl.disabled = !enabled;
+      generating = !enabled;
+    }
+
+    async function getModelResponse() {
+      trimHistory();
+      const chunks = await engine.chat.completions.create({
+        messages: chatHistory,
+        stream: true,
+      });
+
+      const el = addMessage("assistant", "");
+      let reply = "";
+      for await (const chunk of chunks) {
+        reply += chunk.choices[0]?.delta.content || "";
+        el.innerHTML = renderMarkdown(reply);
+        chatMessages.scrollTop = chatMessages.scrollHeight;
+      }
+      chatHistory.push({ role: "assistant", content: reply });
+      return { reply, el };
+    }
+
+    async function sendMessage(userText) {
+      chatHistory.push({ role: "user", content: userText });
+      addMessage("user", userText);
+      setInputEnabled(false);
+
+      const thinkingEl = addMessage("thinking", "Thinking...");
+
+      // --- Agentic loop: model may call tools multiple times ---
+      for (let round = 0; round < MAX_TOOL_ROUNDS; round++) {
+        if (round > 0) thinkingEl.remove();
+
+        const { reply, el } = await getModelResponse();
+        thinkingEl.remove();
+
+        const toolCall = parseToolCall(reply);
+        if (!toolCall) {
+          // No tool call — this is the final answer. Strip any stray markers.
+          el.innerHTML = renderMarkdown(reply.replace(/\[TOOL\s+[^\]]*\]/gi, "").trim());
+          break;
+        }
+
+        // Show what tool is being called
+        el.textContent = `Using ${toolCall.tool}${toolCall.arg ? `: "${toolCall.arg}"` : ""}...`;
+        el.className = "message tool-call";
+        toolCalls++;
+        toolCountEl.textContent = `${toolCalls} tool call${toolCalls !== 1 ? "s" : ""}`;
+
+        // Execute the tool
+        const done = logStart(`[TOOL ${toolCall.tool}${toolCall.arg ? ` "${toolCall.arg}"` : ""}]`, userText);
+        const result = await executeTool(toolCall.tool, toolCall.arg);
+        done(result);
+
+        // Inject result into chat history so model can use it
+        chatHistory.push({
+          role: "user",
+          content: `[TOOL RESULT]\n${result.text}\n[/TOOL RESULT]\n\nNow answer the user's original question using the information above. Do not call another tool unless you need different information.`
+        });
+      }
+
+      setInputEnabled(true);
+      inputEl.focus();
+    }
+
+    addMessage("welcome", WELCOME);
+    updateDocsCount();
+    inputEl.focus();
+
+    sendBtn.addEventListener("click", () => {
+      const text = inputEl.value.trim();
+      if (text && !generating) { inputEl.value = ""; sendMessage(text); }
+    });
+    inputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !generating) sendBtn.click();
+    });
+    attachBtn.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", async () => {
+      await addFiles([...fileInput.files]);
+      fileInput.value = "";
+    });
+    clearDocsBtn.addEventListener("click", () => {
+      docChunks = [];
+      saveDocs();
+      updateDocsCount();
+      addMessage("welcome", "Attached files cleared.");
+    });
+    clearBtn.addEventListener("click", () => {
+      chatHistory = [{ role: "system", content: SYSTEM_PROMPT }];
+      chatMessages.innerHTML = "";
+      toolCalls = 0;
+      toolCountEl.textContent = "0 tool calls";
+      toolListEl.replaceChildren();
+      addMessage("welcome", WELCOME);
+      inputEl.focus();
+    });
+  </script>
+</body>
+</html>
